@@ -17,6 +17,11 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import List, Optional
 
+from pptx import Presentation
+from pptx.util import Inches, Pt, Emu
+from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+
 # ============================================================================
 # DATA MODELS
 # ============================================================================
@@ -144,6 +149,18 @@ INDUSTRY_SPECIFIC = {
         "What manual work goes into supply chain management?",
         "How do you handle equipment maintenance scheduling?",
         "What reporting and documentation is most time-consuming?",
+    ],
+    "aged_care": [
+        "How do you currently manage incident reporting and SIRS notifications to the Aged Care Quality and Safety Commission?",
+        "What's your process for medication management, round documentation, and controlled drug registers?",
+        "How do you collect and organise evidence for the 8 Aged Care Quality Standards?",
+        "What's your experience with AN-ACC funding model documentation and care minutes tracking?",
+        "How do you manage clinical care plans, resident assessments, and progress notes?",
+        "What systems do you use for staff rostering and ensuring you meet mandated care minute targets per resident?",
+        "How do you communicate with residents' families about care updates, wellbeing, and incident notifications?",
+        "What's your biggest compliance documentation challenge in preparing for Commission assessment contacts?",
+        "How do you currently handle reportable assaults, unexplained absences, and other SIRS-reportable events?",
+        "What proportion of your admin time goes to mandatory government reporting vs. direct care support?",
     ]
 }
 
@@ -278,7 +295,8 @@ def generate_interview_doc(client: Client, role_type: str = "both") -> str:
 
     # Add industry-specific questions
     if industry in INDUSTRY_SPECIFIC:
-        doc += f"## {client.industry} Industry-Specific Questions\n\n"
+        industry_display = client.industry.replace("_", " ").title()
+        doc += f"## {industry_display} Industry-Specific Questions\n\n"
         for q in INDUSTRY_SPECIFIC[industry]:
             doc += f"- {q}\n"
         doc += "\n"
@@ -457,6 +475,335 @@ Annual Revenue Potential: ${roi_data['combined']['annual_revenue_potential']:,.0
 
 
 # ============================================================================
+# POWERPOINT REPORT GENERATOR
+# ============================================================================
+
+# Brand colours
+_DARK_BG     = RGBColor(0x1A, 0x1A, 0x2E)   # deep navy
+_GREEN_ACC   = RGBColor(0x00, 0xC9, 0x7B)   # GVRN green
+_WHITE       = RGBColor(0xFF, 0xFF, 0xFF)
+_LIGHT_GREY  = RGBColor(0xCC, 0xCC, 0xCC)
+_MID_GREY    = RGBColor(0x88, 0x88, 0x88)
+_TABLE_ROW1  = RGBColor(0x22, 0x22, 0x3A)   # table odd-row
+_TABLE_ROW2  = RGBColor(0x2A, 0x2A, 0x44)   # table even-row
+
+SLIDE_W = Inches(13.333)
+SLIDE_H = Inches(7.5)
+
+
+def _set_slide_bg(slide, colour=_DARK_BG):
+    bg = slide.background
+    fill = bg.fill
+    fill.solid()
+    fill.fore_color.rgb = colour
+
+
+def _add_textbox(slide, left, top, width, height, text,
+                 font_size=18, colour=_WHITE, bold=False,
+                 alignment=PP_ALIGN.LEFT):
+    txBox = slide.shapes.add_textbox(left, top, width, height)
+    tf = txBox.text_frame
+    tf.word_wrap = True
+    p = tf.paragraphs[0]
+    p.text = text
+    p.font.size = Pt(font_size)
+    p.font.color.rgb = colour
+    p.font.bold = bold
+    p.alignment = alignment
+    return tf
+
+
+def _add_table(slide, rows_data, left, top, width, col_widths,
+               header_colour=_GREEN_ACC, row_font_size=14):
+    """Add a styled table to a slide. rows_data = list of tuples."""
+    rows = len(rows_data)
+    cols = len(rows_data[0]) if rows_data else 2
+    table_shape = slide.shapes.add_table(rows, cols, left, top, width,
+                                          Emu(rows * Pt(row_font_size + 18).emu))
+    table = table_shape.table
+
+    # Set column widths
+    for i, cw in enumerate(col_widths):
+        table.columns[i].width = cw
+
+    for r_idx, row_vals in enumerate(rows_data):
+        for c_idx, val in enumerate(row_vals):
+            cell = table.cell(r_idx, c_idx)
+            cell.text = str(val)
+            # Cell fill
+            cell_fill = cell.fill
+            cell_fill.solid()
+            if r_idx == 0:
+                cell_fill.fore_color.rgb = _DARK_BG
+            else:
+                cell_fill.fore_color.rgb = _TABLE_ROW1 if r_idx % 2 == 1 else _TABLE_ROW2
+
+            for paragraph in cell.text_frame.paragraphs:
+                paragraph.font.size = Pt(row_font_size)
+                paragraph.font.color.rgb = header_colour if r_idx == 0 else _WHITE
+                paragraph.font.bold = r_idx == 0
+                paragraph.alignment = PP_ALIGN.LEFT if c_idx == 0 else PP_ALIGN.RIGHT
+
+    # Remove table borders for a cleaner look via XML
+    from pptx.oxml.ns import qn
+    for r_idx in range(rows):
+        for c_idx in range(cols):
+            cell = table.cell(r_idx, c_idx)
+            tc = cell._tc
+            tcPr = tc.get_or_add_tcPr()
+            for border_tag in ("a:lnL", "a:lnR", "a:lnT", "a:lnB"):
+                ln = tcPr.find(qn(border_tag))
+                if ln is not None:
+                    tcPr.remove(ln)
+                from lxml import etree
+                ln_el = etree.SubElement(tcPr, qn(border_tag), w="0", cap="flat")
+                etree.SubElement(ln_el, qn("a:noFill"))
+
+    return table
+
+
+def _slide_title_bar(slide, title_text, subtitle_text=None):
+    """Add a thin green accent line + title at the top of a content slide."""
+    # Green accent line
+    from pptx.enum.shapes import MSO_SHAPE
+    line = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE,
+                                   Inches(0.6), Inches(0.5),
+                                   Inches(0.08), Inches(0.55))
+    line.fill.solid()
+    line.fill.fore_color.rgb = _GREEN_ACC
+    line.line.fill.background()
+
+    _add_textbox(slide, Inches(0.9), Inches(0.4), Inches(10), Inches(0.55),
+                 title_text, font_size=28, colour=_WHITE, bold=True)
+    if subtitle_text:
+        _add_textbox(slide, Inches(0.9), Inches(0.95), Inches(10), Inches(0.4),
+                     subtitle_text, font_size=14, colour=_LIGHT_GREY)
+
+
+def generate_executive_pptx(project: AuditProject, roi_data: dict,
+                            output_path: Path) -> Path:
+    """Generate a branded executive PowerPoint presentation."""
+
+    client = project.client
+    opportunities = project.opportunities
+    quick_wins = [o for o in opportunities if o.category == "quick_win"]
+    big_swings = [o for o in opportunities if o.category == "big_swing"]
+
+    prs = Presentation()
+    prs.slide_width = SLIDE_W
+    prs.slide_height = SLIDE_H
+    blank_layout = prs.slide_layouts[6]  # blank
+
+    # ------------------------------------------------------------------
+    # SLIDE 1: Cover
+    # ------------------------------------------------------------------
+    slide = prs.slides.add_slide(blank_layout)
+    _set_slide_bg(slide)
+
+    # Green accent bar at top
+    from pptx.enum.shapes import MSO_SHAPE
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE,
+                                  Inches(0), Inches(0),
+                                  SLIDE_W, Inches(0.08))
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = _GREEN_ACC
+    bar.line.fill.background()
+
+    _add_textbox(slide, Inches(0.8), Inches(1.8), Inches(11), Inches(0.9),
+                 "GVRN-AI", font_size=20, colour=_GREEN_ACC, bold=True)
+    _add_textbox(slide, Inches(0.8), Inches(2.5), Inches(11), Inches(1.0),
+                 "AI Opportunity Assessment", font_size=40, colour=_WHITE, bold=True)
+    _add_textbox(slide, Inches(0.8), Inches(3.6), Inches(11), Inches(0.7),
+                 client.company_name, font_size=28, colour=_LIGHT_GREY)
+
+    date_str = datetime.now().strftime("%B %Y")
+    _add_textbox(slide, Inches(0.8), Inches(5.0), Inches(11), Inches(0.5),
+                 f"Prepared for {client.contact_name}  |  {date_str}",
+                 font_size=14, colour=_MID_GREY)
+
+    # Bottom green bar
+    bar2 = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE,
+                                   Inches(0), SLIDE_H - Inches(0.08),
+                                   SLIDE_W, Inches(0.08))
+    bar2.fill.solid()
+    bar2.fill.fore_color.rgb = _GREEN_ACC
+    bar2.line.fill.background()
+
+    # ------------------------------------------------------------------
+    # SLIDE 2: Executive Summary
+    # ------------------------------------------------------------------
+    slide = prs.slides.add_slide(blank_layout)
+    _set_slide_bg(slide)
+    _slide_title_bar(slide, "Executive Summary",
+                     f"Based on {project.interviews_completed} discovery interviews")
+
+    combined = roi_data["combined"]
+    summary_rows = [
+        ("Metric", "Value"),
+        ("Total Opportunities Identified", str(len(opportunities))),
+        ("Quick Wins (Start Immediately)", str(len(quick_wins))),
+        ("Strategic Initiatives", str(len(big_swings))),
+        ("Estimated Hours Saved / Week", f"{combined['hours_saved_weekly']:.0f} hrs"),
+        ("Annual Cost Savings", f"${combined['annual_savings']:,.0f}"),
+        ("Annual Revenue Potential", f"${combined['annual_revenue_potential']:,.0f}"),
+        ("Total Annual Value", f"${combined['total_annual_value']:,.0f}"),
+    ]
+
+    _add_table(slide, summary_rows,
+               left=Inches(0.8), top=Inches(1.6),
+               width=Inches(8), col_widths=[Inches(5), Inches(3)],
+               row_font_size=15)
+
+    # Callout box on the right
+    _add_textbox(slide, Inches(9.3), Inches(2.0), Inches(3.5), Inches(0.4),
+                 "TOTAL ANNUAL VALUE", font_size=13, colour=_GREEN_ACC, bold=True,
+                 alignment=PP_ALIGN.CENTER)
+    _add_textbox(slide, Inches(9.3), Inches(2.5), Inches(3.5), Inches(0.7),
+                 f"${combined['total_annual_value']:,.0f}",
+                 font_size=36, colour=_WHITE, bold=True,
+                 alignment=PP_ALIGN.CENTER)
+    _add_textbox(slide, Inches(9.3), Inches(3.3), Inches(3.5), Inches(0.4),
+                 f"ROI {combined['roi_percentage']:.0f}%  |  Payback {combined['payback_months']:.1f} mo",
+                 font_size=13, colour=_LIGHT_GREY, alignment=PP_ALIGN.CENTER)
+
+    # ------------------------------------------------------------------
+    # SLIDES 3–N: One per Quick Win
+    # ------------------------------------------------------------------
+    for idx, opp in enumerate(quick_wins, 1):
+        slide = prs.slides.add_slide(blank_layout)
+        _set_slide_bg(slide)
+        _slide_title_bar(slide, f"Quick Win #{idx}: {opp.name}",
+                         "Low Effort  |  High Impact")
+
+        # Current State
+        _add_textbox(slide, Inches(0.9), Inches(1.6), Inches(5.5), Inches(0.35),
+                     "CURRENT STATE", font_size=13, colour=_GREEN_ACC, bold=True)
+        _add_textbox(slide, Inches(0.9), Inches(2.0), Inches(5.5), Inches(1.5),
+                     opp.description, font_size=16, colour=_LIGHT_GREY)
+
+        # Proposed Solution
+        _add_textbox(slide, Inches(0.9), Inches(3.7), Inches(5.5), Inches(0.35),
+                     "PROPOSED SOLUTION", font_size=13, colour=_GREEN_ACC, bold=True)
+
+        solution_text = (f"Automate and streamline this workflow using AI-powered tools, "
+                         f"eliminating manual effort and reducing error rates.")
+        _add_textbox(slide, Inches(0.9), Inches(4.1), Inches(5.5), Inches(1.2),
+                     solution_text, font_size=16, colour=_LIGHT_GREY)
+
+        # Impact panel on the right
+        hourly = roi_data["combined"]["hourly_rate"]
+        weekly_hrs = opp.hours_saved_weekly * opp.employees_affected * 0.7
+        weekly_saving = weekly_hrs * hourly
+        annual_saving = weekly_saving * 52
+
+        impact_rows = [
+            ("Impact Metric", "Value"),
+            ("Hours Saved / Week", f"{weekly_hrs:.0f} hrs"),
+            ("Employees Affected", str(opp.employees_affected)),
+            ("Est. Weekly Saving", f"${weekly_saving:,.0f}"),
+            ("Est. Annual Saving", f"${annual_saving:,.0f}"),
+            ("Implementation", "1-2 weeks"),
+        ]
+        _add_table(slide, impact_rows,
+                   left=Inches(7.0), top=Inches(1.6),
+                   width=Inches(5.5), col_widths=[Inches(3), Inches(2.5)],
+                   row_font_size=14)
+
+    # ------------------------------------------------------------------
+    # SLIDE: ROI Summary
+    # ------------------------------------------------------------------
+    slide = prs.slides.add_slide(blank_layout)
+    _set_slide_bg(slide)
+    _slide_title_bar(slide, "Return on Investment",
+                     "Cost savings + revenue potential from redirected capacity")
+
+    roi_rows = [
+        ("Metric", "Value"),
+        ("Estimated Implementation Cost", f"${combined['implementation_cost']:,.0f}"),
+        ("Hours Saved / Week", f"{combined['hours_saved_weekly']:.0f} hrs"),
+        ("Annual Cost Savings", f"${combined['annual_savings']:,.0f}"),
+        ("Annual Revenue Potential", f"${combined['annual_revenue_potential']:,.0f}"),
+        ("Total Annual Value", f"${combined['total_annual_value']:,.0f}"),
+        ("Payback Period", f"{combined['payback_months']:.1f} months"),
+        ("First Year ROI", f"{combined['roi_percentage']:.0f}%"),
+    ]
+    _add_table(slide, roi_rows,
+               left=Inches(0.8), top=Inches(1.6),
+               width=Inches(8), col_widths=[Inches(5), Inches(3)],
+               row_font_size=15)
+
+    # Visual callout
+    _add_textbox(slide, Inches(9.3), Inches(2.0), Inches(3.5), Inches(0.4),
+                 "FIRST YEAR ROI", font_size=13, colour=_GREEN_ACC, bold=True,
+                 alignment=PP_ALIGN.CENTER)
+    _add_textbox(slide, Inches(9.3), Inches(2.5), Inches(3.5), Inches(0.7),
+                 f"{combined['roi_percentage']:.0f}%",
+                 font_size=44, colour=_WHITE, bold=True,
+                 alignment=PP_ALIGN.CENTER)
+    _add_textbox(slide, Inches(9.3), Inches(3.4), Inches(3.5), Inches(0.4),
+                 f"Payback in {combined['payback_months']:.1f} months",
+                 font_size=14, colour=_LIGHT_GREY, alignment=PP_ALIGN.CENTER)
+
+    # ------------------------------------------------------------------
+    # SLIDE: Next Steps
+    # ------------------------------------------------------------------
+    slide = prs.slides.add_slide(blank_layout)
+    _set_slide_bg(slide)
+    _slide_title_bar(slide, "Recommended Next Steps")
+
+    steps = [
+        ("1", "Approve Phase 1 Quick Wins",
+         "Start with the highest-impact, lowest-effort items identified in this assessment."),
+        ("2", "Schedule Kickoff Meeting",
+         "Align the project team and define success metrics for each automation."),
+        ("3", "Begin Implementation",
+         "Target 2-4 week delivery for the first automation, with iterative rollout."),
+        ("4", "Measure & Iterate",
+         "Track time savings against baseline and expand to Phase 2 strategic initiatives."),
+    ]
+
+    y_offset = Inches(1.8)
+    for num, title, desc in steps:
+        # Number circle (green square as proxy)
+        circle = slide.shapes.add_shape(MSO_SHAPE.OVAL,
+                                         Inches(0.9), y_offset,
+                                         Inches(0.45), Inches(0.45))
+        circle.fill.solid()
+        circle.fill.fore_color.rgb = _GREEN_ACC
+        circle.line.fill.background()
+        tf = circle.text_frame
+        tf.word_wrap = False
+        p = tf.paragraphs[0]
+        p.text = num
+        p.font.size = Pt(16)
+        p.font.color.rgb = _DARK_BG
+        p.font.bold = True
+        p.alignment = PP_ALIGN.CENTER
+        tf.paragraphs[0].space_before = Pt(0)
+        tf.paragraphs[0].space_after = Pt(0)
+
+        _add_textbox(slide, Inches(1.6), y_offset - Inches(0.05),
+                     Inches(10), Inches(0.4),
+                     title, font_size=20, colour=_WHITE, bold=True)
+        _add_textbox(slide, Inches(1.6), y_offset + Inches(0.35),
+                     Inches(10), Inches(0.4),
+                     desc, font_size=14, colour=_LIGHT_GREY)
+
+        y_offset += Inches(1.2)
+
+    # Footer on last slide
+    _add_textbox(slide, Inches(0.8), SLIDE_H - Inches(0.7), Inches(11), Inches(0.4),
+                 "GVRN-AI  |  AI Audit Framework  |  Confidential",
+                 font_size=11, colour=_MID_GREY, alignment=PP_ALIGN.CENTER)
+
+    # ------------------------------------------------------------------
+    # Save
+    # ------------------------------------------------------------------
+    prs.save(str(output_path))
+    return output_path
+
+
+# ============================================================================
 # CLI INTERFACE
 # ============================================================================
 
@@ -565,27 +912,57 @@ def main():
     # Example mode
     if args.example:
         client = Client(
-            company_name="Acme Healthcare Clinic",
-            industry="healthcare",
-            employee_count=45,
-            contact_name="Dr. Sarah Johnson",
-            contact_email="sarah@acmeclinic.com",
-            avg_salary=72000
+            company_name="Maplewood Residential Aged Care",
+            industry="aged_care",
+            employee_count=40,
+            contact_name="Karen Mitchell",
+            contact_email="karen.mitchell@maplewoodcare.com.au",
+            avg_salary=62000  # AUD average across RNs, ENs, PCAs, and admin
         )
 
         opportunities = [
-            Opportunity("Patient Intake Automation", "Staff spend 20 min per patient on manual form entry", 8, 3, "low", "high"),
-            Opportunity("Appointment Reminder System", "Manual phone calls for appointment reminders", 10, 2, "low", "high"),
-            Opportunity("Insurance Verification Bot", "Staff manually verify insurance for each patient", 15, 2, "medium", "high"),
-            Opportunity("AI Medical Scribe", "Doctors spend 2 hrs/day on documentation", 10, 5, "high", "high"),
-            Opportunity("Patient FAQ Chatbot", "Repetitive phone inquiries about hours, location, etc.", 5, 2, "low", "medium"),
+            Opportunity(
+                "Digital Incident Reporting & SIRS Compliance",
+                "Paper-based incident forms take 30-45 min each; SIRS notifications to the Aged Care Quality and Safety Commission are manually tracked in a spreadsheet",
+                6, 3, "low", "high"
+            ),
+            Opportunity(
+                "AI-Assisted Quality Standards Documentation",
+                "Admin staff spend 12+ hrs/week manually compiling evidence portfolios for the 8 Aged Care Quality Standards and continuous improvement registers",
+                10, 3, "low", "high"
+            ),
+            Opportunity(
+                "Automated AN-ACC Care Minutes Tracking",
+                "Manual tracking of direct and indirect care minutes across shifts for AN-ACC funding submissions; staff record on paper timesheets then admin re-enters into government portal",
+                5, 5, "low", "high"
+            ),
+            Opportunity(
+                "Electronic Medication Management",
+                "Paper medication charts with manual round tracking; double-handling between pharmacy orders, GP scripts, and MAR charts increases medication error risk",
+                4, 8, "high", "high"
+            ),
+            Opportunity(
+                "Clinical Care Plan Automation",
+                "Quarterly care plan reviews done manually across 45 residents with paper-based assessments; RNs spend evenings updating plans instead of providing direct care",
+                3, 8, "high", "high"
+            ),
+            Opportunity(
+                "Resident & Family Communication Portal",
+                "Manual phone calls and printed letters to families for care updates, activity schedules, and incident notifications; families frequently call reception for updates",
+                3, 4, "low", "low"
+            ),
+            Opportunity(
+                "Staff Rostering Optimisation",
+                "Manual roster creation in spreadsheets; difficulty balancing AN-ACC care minute targets, staff availability, and award conditions across 24/7 shifts",
+                5, 2, "low", "low"
+            ),
         ]
 
         project = AuditProject(
             client=client,
             opportunities=opportunities,
             created_date=datetime.now().isoformat(),
-            interviews_completed=6,
+            interviews_completed=8,
             status="analysis"
         )
 
@@ -605,13 +982,18 @@ def main():
         print(f"Opportunity matrix: {m_path}")
 
         # ROI calculation
-        roi_data = calculate_audit_roi(opportunities, client.avg_salary, 15000)
+        roi_data = calculate_audit_roi(opportunities, client.avg_salary, 25000)
 
         # Executive report
         report = generate_executive_report(project, roi_data)
         r_path = output_dir / "executive_report.md"
         r_path.write_text(report)
         print(f"Executive report: {r_path}")
+
+        # Executive PowerPoint
+        pptx_path = output_dir / "executive_presentation.pptx"
+        generate_executive_pptx(project, roi_data, pptx_path)
+        print(f"Executive PPTX:   {pptx_path}")
 
         # Save project
         save_project(project, output_dir)
@@ -663,6 +1045,10 @@ def main():
         r_path = output_dir / "executive_report.md"
         r_path.write_text(report)
         print(f"Saved to: {r_path}")
+
+        pptx_path = output_dir / "executive_presentation.pptx"
+        generate_executive_pptx(project, roi_data, pptx_path)
+        print(f"Saved to: {pptx_path}")
 
 
 if __name__ == "__main__":
